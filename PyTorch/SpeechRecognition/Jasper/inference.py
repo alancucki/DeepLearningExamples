@@ -52,7 +52,6 @@ def parse_args():
     parser.add_argument("--save_prediction", type=str, default=None, help="if specified saves predictions in text form at this location")
     parser.add_argument("--logits_save_to", default=None, type=str, help="if specified will save logits to path")
     parser.add_argument("--seed", default=42, type=int, help='seed')
-    parser.add_argument("--masked_fill", type="bool", help="Overrides the masked_fill option for the Encoder")
     parser.add_argument("--output_dir", default="results/", type=str, help="Output directory to store exported models. Only used if --export_model is used")
     parser.add_argument("--export_model", action='store_true', help="Exports the audio_featurizer, encoder and decoder using torch.jit to the output_dir")
     parser.add_argument("--wav", type=str, help='absolute path to .wav file (16KHz)')
@@ -113,7 +112,7 @@ def jit_export(
 
                 module_name = "{}_{}".format(os.path.basename(args.model_toml), "fp16" if args.fp16 else "fp32")
 
-                if args.masked_fill is not None and args.masked_fill == False:
+                if args.use_conv_mask:
                     module_name = module_name + "_noMaskConv"
 
                 # Export just the featurizer
@@ -138,10 +137,14 @@ def jit_export(
                 return traced_module_feat, traced_module_acoustic, traced_module_decode
 
 def run_once(audio_processor, encoderdecoder, greedy_decoder, audio, audio_len, labels):
-            features = audio_processor(audio, audio_len)
+            features, lens = audio_processor(audio, audio_len)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            t_log_probs_e = encoderdecoder(features[0])
+            # TorchScripted model does not support (features, lengths)
+            if isinstance(encoderdecoder, torch.jit.TracedModule):
+                t_log_probs_e = encoderdecoder(features)
+            else:
+                t_log_probs_e, _ = encoderdecoder.infer((features, lens))
             torch.cuda.synchronize()
             t1 = time.perf_counter()
             t_predictions_e = greedy_decoder(log_probs=t_log_probs_e)
@@ -178,7 +181,7 @@ def eval(
                 jit_audio_processor, jit_encoderdecoder, jit_greedy_decoder = jit_export(audio, audio_len, audio_processor,
                                                                                          encoderdecoder,
                                                                                          greedy_decoder,args)
-            run_once(jit_audio_processor, jit_encoderdecoder, jit_greedy_decoder, audio, audio_len, labels)
+                run_once(jit_audio_processor, jit_encoderdecoder, jit_greedy_decoder, audio, audio_len, labels)
             return
         wer, _global_var_dict = calc_wer(data_layer, audio_processor, encoderdecoder, greedy_decoder, labels, args)
         if (not multi_gpu or (multi_gpu and torch.distributed.get_rank() == 0)):
@@ -232,11 +235,11 @@ def main(args):
     featurizer_config = jasper_model_definition['input_eval']
     featurizer_config["optimization_level"] = optim_level
     featurizer_config["fp16"] = args.fp16
-    args.use_conv_mask = jasper_model_definition['encoder'].get('convmask', True)
 
-    if args.masked_fill is not None:
-        print("{} masked_fill".format("Enabling" if args.masked_fill else "Disabling"))
-        jasper_model_definition["encoder"]["conv_mask"] = args.masked_fill
+    args.use_conv_mask = jasper_model_definition['encoder'].get('convmask', True)
+    if args.use_conv_mask and args.export_model:
+        print('WARNING: Masked convs currently not supported for TorchScript. Disabling.')
+        jasper_model_definition['encoder']['convmask'] = False
 
     if args.max_duration is not None:
         featurizer_config['max_duration'] = args.max_duration
